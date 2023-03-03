@@ -1,9 +1,9 @@
-package com.github.tylerreisinger.bitburnerjbintegration.listeners
+package com.tyler.bitburner.listeners
 
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManagerListener
-import com.github.tylerreisinger.bitburnerjbintegration.services.MyProjectService
+import com.tyler.bitburner.services.MyProjectService
 
 internal class MyProjectManagerListener : ProjectManagerListener {
 

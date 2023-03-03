@@ -1,7 +1,7 @@
-package com.github.tylerreisinger.bitburnerjbintegration.services
+package com.tyler.bitburner.services
 
 import com.intellij.openapi.project.Project
-import com.github.tylerreisinger.bitburnerjbintegration.MyBundle
+import com.tyler.bitburner.MyBundle
 
 class MyProjectService(project: Project) {
 

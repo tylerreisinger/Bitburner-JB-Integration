@@ -1,6 +1,6 @@
-package com.github.tylerreisinger.bitburnerjbintegration.services
+package com.tyler.bitburner.services
 
-import com.github.tylerreisinger.bitburnerjbintegration.MyBundle
+import com.tyler.bitburner.MyBundle
 
 class MyApplicationService {
 

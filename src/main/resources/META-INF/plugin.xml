@@ -1,18 +1,22 @@
 <!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
 <idea-plugin>
-    <id>com.github.tylerreisinger.bitburnerjbintegration</id>
-    <name>IntelliJ Platform Plugin Bitburner-JB-Integration</name>
-    <vendor>tylerreisinger</vendor>
+    <id>com.tyler.bitburner</id>
+    <name>Bitburner Integration</name>
+    <vendor>Tyler Reisinger</vendor>
 
     <depends>com.intellij.modules.platform</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <applicationService serviceImplementation="com.github.tylerreisinger.bitburnerjbintegration.services.MyApplicationService"/>
-        <projectService serviceImplementation="com.github.tylerreisinger.bitburnerjbintegration.services.MyProjectService"/>
+        <applicationService serviceImplementation="com.tyler.bitburner.services.MyApplicationService"/>
+        <projectService serviceImplementation="com.tyler.bitburner.services.MyProjectService"/>
     </extensions>
 
-    <applicationListeners>
-        <listener class="com.github.tylerreisinger.bitburnerjbintegration.listeners.MyProjectManagerListener"
-                  topic="com.intellij.openapi.project.ProjectManagerListener"/>
-    </applicationListeners>
+    <extensions defaultExtensionNs="com.intellij">
+        <projectConfigurable
+                parentId="tools"
+                instance="com.tyler.bitburner.settings.BitburnerConfigurable"
+                id="com.tyler.bitburner.settings.BitburnerConfigurable"
+                displayName="Bitburner Integration Settings"
+        />
+    </extensions>
 </idea-plugin>
