@@ -3,7 +3,6 @@
 package com.tyler.bitburner.websocket
 
 import com.intellij.openapi.Disposable
-import com.intellij.openapi.diagnostic.Logger
 import com.intellij.util.io.toByteArray
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -166,7 +165,6 @@ class Client(val socket: Socket,
             ) : Disposable
 {
     companion object {
-        private val logger = Logger.getInstance(WebSocketServer::class.java)
         /**
          * How often to send a ping, in ms.
          *
@@ -198,7 +196,7 @@ class Client(val socket: Socket,
         if (!disableAutoPing) {
             timer(period=PERIOD_MS, initialDelay=2000) {
                 if (socket.isClosed || !socket.isConnected) {
-                    logger.warn("Underlying WebSocket socket closed from under us")
+                    server.logDispatcher?.warn("Underlying WebSocket socket closed from under us")
                     server.clientDisconnected(this@Client, CloseStatusCode.AbnormalClosure)
                     socket.close()
                 } else if(handshakeComplete) {
@@ -209,7 +207,7 @@ class Client(val socket: Socket,
                     // time. We'll allow two ping-pong cycles to go by with some latency grace period to go by before
                     // deciding it to be in timeout.
                     if (elapsedMillis > PERIOD_MS*1.5) {
-                        logger.warn("Pong timeout - the client is not responding.")
+                        server.logDispatcher?.warn("Pong timeout - the client is not responding.")
                         server.clientDisconnected(this@Client)
                         this@Client.close(CloseStatusCode.ProtocolError, message="Connection Timeout")
                     }
@@ -245,7 +243,7 @@ class Client(val socket: Socket,
      * When in doubt, create a header with only the fields you need and use the default values for the rest.
      */
     fun write(data: ByteArray, header: WebSocketHeader) {
-        logger.debug("Sending frame ${header}.")
+        server.logDispatcher?.debug("Sending frame ${header}.")
         val headerData = header.encode()
         val frameData = headerData + data
         header.length = data.size.toLong()
@@ -256,7 +254,7 @@ class Client(val socket: Socket,
      * Send a ping
      */
     fun ping() {
-        logger.info("Ping sent")
+        server.logDispatcher?.info("Ping sent")
         write(ByteArray(0), WebSocketHeader(0, opcode=OpCode.Ping))
     }
 
@@ -323,7 +321,7 @@ class Client(val socket: Socket,
                 inputStream.close()
             }
 
-            logger.info("Clean connection negotiation completed for ${socket.inetAddress}:${socket.port}. " +
+            server.logDispatcher?.info("Clean connection negotiation completed for ${socket.inetAddress}:${socket.port}. " +
                     "Final status: $status." + (exitMsg ?: "")
             )
 
@@ -578,12 +576,13 @@ internal class NonOwningInputStreamReader(stream: InputStream, charset: Charset 
  *
  * In the current implementation, it only accepts a single connected client at once. It is written to allow this to be
  * extended in the future to multiple simultaneous clients if that becomes useful.
+ *
+ * @param logDispatcher an optional instance of a LogDispatcher that sends internal log messages to the application
+ * logDispatcher?.
  */
 // @Suppress("PrivatePropertyName", "PropertyName")
-class WebSocketServer {
+class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
     companion object {
-        internal val logger = Logger.getInstance(WebSocketServer::class.java)
-
         /**
          *
          */
@@ -712,7 +711,7 @@ class WebSocketServer {
                     val outputStream = withContext(Dispatchers.IO) {
                         clientSocket.getOutputStream()
                     }
-                    logger.info("Incoming client connection")
+                    logDispatcher?.info("Incoming client connection")
 
 
                     val client = Client(clientSocket, inputStream, outputStream, this)
@@ -743,42 +742,42 @@ class WebSocketServer {
             val frame = withContext(Dispatchers.IO) {
                 parseFrame(client)
             }
-            logger.debug(frame.header.toString())
-            logger.debug("\tData: ${String(frame.data, Charset.forName("utf-8"))}")
+            logDispatcher?.debug(frame.header.toString())
+            logDispatcher?.debug("\tData: ${String(frame.data, Charset.forName("utf-8"))}")
 
             when (frame.header.opCode) {
                 OpCode.Continuation -> {
                     val ex = WebSocketException("Got an unexpected OpCode.Continuation frame. " +
                             "This is a client or server bug!")
-                    logger.error(ex)
+                    logDispatcher?.error(ex)
                 }
                 OpCode.Text -> {
-                    logger.info("Text Frame")
+                    logDispatcher?.info("Text Frame")
                 }
                 OpCode.Binary -> {
-                    logger.info("Data Frame")
+                    logDispatcher?.info("Data Frame")
                 }
                 OpCode.Custom1, OpCode.Custom2, OpCode.Custom3, OpCode.Custom4, OpCode.Custom5 -> {
-                    logger.info("Custom frame")
+                    logDispatcher?.info("Custom frame")
                 }
                 OpCode.Close -> {
-                    logger.warn("Client requested WebSocket closure")
+                    logDispatcher?.warn("Client requested WebSocket closure")
                     if (frame.data.size >= 2) {
                         val statusCode: Short = ByteBuffer.wrap(frame.data).order(ByteOrder.BIG_ENDIAN)
                             .asShortBuffer()[0]
                     }
                 }
                 OpCode.Ping -> {
-                    logger.info("Ping received")
+                    logDispatcher?.info("Ping received")
                     client.ping()
                 }
                 OpCode.Pong -> {
-                    logger.info("Pong received")
+                    logDispatcher?.info("Pong received")
                     client.pongReceived(frame)
                 }
                 else -> {
                     val error =  WebSocketException("Found a reserved opcode outside the valid range.")
-                    logger.error(error)
+                    logDispatcher?.error(error)
                     throw error
                 }
             }
@@ -819,7 +818,6 @@ class WebSocketServer {
      * Handle the HTTP protocol upgrade, before we can drop into a websocket connection.
      */
     private suspend fun doHandshake(client: Client) {
-        val logger = Logger.getInstance(WebSocketServer::class.java)
         val reader = BufferedReader(NonOwningInputStreamReader(client.inputStream))
 
         val requestStr = withContext(Dispatchers.IO) {
@@ -851,7 +849,7 @@ class WebSocketServer {
             }
         }
         val headersStr = headers.map { "${it.key}: ${it.value}" }.joinToString("\r\n", postfix="\r\n\r\n")
-        logger.info("Got HTTP request: $requestStr\n$headersStr")
+        logDispatcher?.info("Got HTTP request: $requestStr\n$headersStr")
 
         if (headers["Upgrade"]?.get(0) == "websocket" && headers.containsKey("Sec-WebSocket-Key")) {
             sendHandshakeResponse(client, headers)
@@ -890,7 +888,7 @@ class WebSocketServer {
         ))
 
         val responseStr = responseLines.joinToString("\r\n", postfix="\r\n\r\n")
-        logger.info("Protocol upgrade response:\n$responseStr")
+        logDispatcher?.info("Protocol upgrade response:\n$responseStr")
         withContext(Dispatchers.IO) {
             client.outputStream.write(responseStr.encodeToByteArray())
             client.outputStream.flush()

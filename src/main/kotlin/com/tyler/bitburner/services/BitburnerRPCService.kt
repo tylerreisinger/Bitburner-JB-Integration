@@ -2,13 +2,18 @@ package com.tyler.bitburner.services
 
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.components.Service
+import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.project.Project
+import com.tyler.bitburner.websocket.LogDispatcher
+import com.tyler.bitburner.websocket.LogLevel
 import com.tyler.bitburner.websocket.WebSocketServer
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 
 @Service(Service.Level.PROJECT)
 class BitburnerRPCService(proj: Project) : Disposable {
+    private var logger = logger<BitburnerRPCService>()
     private var _server: WebSocketServer? = null
     private var _proj = proj
 
@@ -36,7 +41,7 @@ class BitburnerRPCService(proj: Project) : Disposable {
      * connection and handshake.
      */
     fun start(port: Int) {
-        _server = WebSocketServer()
+        _server = WebSocketServer(IntelliJLogDispatcher())
         _server?.start(port)
     }
 
@@ -57,7 +62,7 @@ class BitburnerRPCService(proj: Project) : Disposable {
      * wait for a graceful close, after which it will cancel all remaining jobs.
      */
     override fun dispose() {
-        WebSocketServer.logger.info("Disposing BitburnerRPCService")
+        logger.info("Disposing BitburnerRPCService")
         val startTime = System.currentTimeMillis()
         val job = _server?.stop()
         // We will wait for a very short period to send a close signal and potentially get a reply.
@@ -68,7 +73,48 @@ class BitburnerRPCService(proj: Project) : Disposable {
             Thread.sleep(5)
         }
         server?.coroutineScope?.cancel("Server shutdown")
-        WebSocketServer.logger.info(
+        logger.info(
             "${WebSocketServer::class.simpleName}.dispose took ${System.currentTimeMillis() - startTime} ms")
     }
+}
+
+class IntelliJLogDispatcher : LogDispatcher {
+    @PublishedApi
+    internal val logger = Logger.getInstance(WebSocketServer::class.java)
+
+    override fun trace(msg: String) {
+        logger.trace(msg)
+    }
+    override fun trace(t: Throwable) {
+        logger.trace(t)
+    }
+    override fun debug(msg: String) {
+        logger.debug(msg)
+    }
+    override fun debug(t: Throwable) {
+        logger.debug(t)
+    }
+    override fun info(msg: String) {
+        logger.info(msg)
+    }
+    override fun info(t: Throwable) {
+        logger.info(t)
+    }
+    override fun warn(msg: String) {
+        logger.warn(msg)
+    }
+    override fun warn(t: Throwable) {
+        logger.warn(t)
+    }
+    override fun error(throwable: Throwable?) {
+        logger.error(throwable)
+    }
+    override fun error(msg: String, throwable: Throwable?) {
+        if (throwable != null) {
+            logger.error(msg, throwable)
+        } else {
+            logger.error(msg)
+        }
+    }
+
 }
