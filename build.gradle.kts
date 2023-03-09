@@ -18,6 +18,10 @@ plugins {
     id("org.jetbrains.kotlinx.kover") version "0.6.1"
 }
 
+dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.4")
+}
+
 group = properties("pluginGroup")
 version = properties("pluginVersion")
 

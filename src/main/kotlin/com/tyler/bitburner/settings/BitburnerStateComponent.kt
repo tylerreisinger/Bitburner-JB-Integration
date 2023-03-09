@@ -1,6 +1,5 @@
 package com.tyler.bitburner.settings
 
-import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.*
 import com.intellij.openapi.project.Project
 
@@ -14,7 +13,6 @@ class BitburnerStateComponent: PersistentStateComponent<BitburnerStateComponent.
         fun getInstance(project: Project): BitburnerStateComponent {
             return project.getService(BitburnerStateComponent::class.java)
         }
-
     }
 
     private var _state = BitburnerState()
@@ -28,7 +26,6 @@ class BitburnerStateComponent: PersistentStateComponent<BitburnerStateComponent.
     }
 
     class BitburnerState {
-        var apiKey = ""
         var isEnabled = false
     }
 }

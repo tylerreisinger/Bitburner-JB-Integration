@@ -7,16 +7,26 @@
     <depends>com.intellij.modules.platform</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <applicationService serviceImplementation="com.tyler.bitburner.services.MyApplicationService"/>
-        <projectService serviceImplementation="com.tyler.bitburner.services.MyProjectService"/>
-    </extensions>
+        <projectOpenProcessor id="Bitburner" implementation="com.tyler.bitburner.extensions.BBProjectOpenedProcessor" />
 
-    <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="com.tyler.bitburner.services.BitburnerRPCService" />
+
         <projectConfigurable
                 parentId="tools"
                 instance="com.tyler.bitburner.settings.BitburnerConfigurable"
                 id="com.tyler.bitburner.settings.BitburnerConfigurable"
                 displayName="Bitburner Integration Settings"
         />
+
+        <notificationGroup id="Bitburner"
+                           displayType="BALLOON"
+                           key="com.tyler.bitburner"
+        />
     </extensions>
+
+    <applicationListeners>
+        <listener class="com.tyler.bitburner.listeners.BBProjectManagerListener"
+                  topic="com.intellij.openapi.project.ProjectManagerListener"
+          />
+    </applicationListeners>
 </idea-plugin>
