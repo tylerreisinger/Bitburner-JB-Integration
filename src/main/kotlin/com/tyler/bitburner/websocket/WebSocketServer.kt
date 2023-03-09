@@ -580,9 +580,9 @@ internal class NonOwningInputStreamReader(stream: InputStream, charset: Charset 
  * extended in the future to multiple simultaneous clients if that becomes useful.
  */
 // @Suppress("PrivatePropertyName", "PropertyName")
-class WebSocketServer : Disposable {
+class WebSocketServer {
     companion object {
-        private val logger = Logger.getInstance(WebSocketServer::class.java)
+        internal val logger = Logger.getInstance(WebSocketServer::class.java)
 
         /**
          *
@@ -612,7 +612,7 @@ class WebSocketServer : Disposable {
     internal val client
         get() = _client
 
-    // {{ Public general api
+    // {{{ Public general api
 
     /**
      * Start listening on the given port. The servers are scoped to a project, so multiple can run at once in multiple
@@ -661,16 +661,12 @@ class WebSocketServer : Disposable {
         return job
     }
 
-    override fun dispose() {
-        stop()
-    }
+    // Public general api }}}
 
-    // Public general api }}
+    // {{{ Public events api
+    // Public events api }}}
 
-    // {{ Public events api
-    // Public events api }}
-
-    // {{ Internal events api
+    // {{{ Internal events api
 
     internal fun closeClientConnection(client: Client,
                               statusCode: CloseStatusCode = CloseStatusCode.Normal,
@@ -697,9 +693,9 @@ class WebSocketServer : Disposable {
         }
     }
 
-    // Internal events api }}
+    // Internal events api }}}
 
-    // {{ Private api
+    // {{{ Private api
     private suspend fun acceptConnection(listenSocket: ServerSocket) {
         while (!listenSocket.isClosed) {
             if (_client != null) {
@@ -911,7 +907,7 @@ class WebSocketServer : Disposable {
         return receiveBytes(client.inputStream, len)
     }
 
-    // Private api }}
+    // Private api }}}
 }
 
 /**
