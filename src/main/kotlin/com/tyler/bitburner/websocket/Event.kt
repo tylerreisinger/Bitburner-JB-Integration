@@ -1,14 +1,17 @@
 package com.tyler.bitburner.websocket
 
-enum class PropagationType {
-    Continue,
-    Stop,
-    Error;
-}
+import java.net.Socket
 
-data class EventReturn<R>(val result: R, val propagation: PropagationType = PropagationType.Continue)
-
-class EventReturnBundle<R>(bundle: MutableList<EventReturn<R>>) {
+enum class StandardEventCategory : EventCategory {
+    ConnectionAttempt,
+    ConnectionAccepted,
+    WebsocketNegotiated,
+    ConnectionClosing,
+    ConnectionClosedGracefully,
+    ContentFrameReceived,
+    ControlFrameReceived,
+    PingReceived,
+    FrameSent,
 }
 
 fun interface EventListener<C: EventCategory, E: Event<C>> : (E) -> Unit {
@@ -22,9 +25,23 @@ interface EventCategory {
 
 interface Event<C: EventCategory>{
     val category: C
+    val server: WebSocketServer
 }
 
-class EventDispatcher<C: EventCategory, E: Event<C>, R, F: EventListener<C, E>> {
+interface LogDispatcher {
+    fun trace(msg: String)
+    fun trace(t: Throwable)
+    fun debug(msg: String)
+    fun debug(t: Throwable)
+    fun info(msg: String)
+    fun info(t: Throwable)
+    fun warn(msg: String)
+    fun warn(t: Throwable)
+    fun error(throwable: Throwable?)
+    fun error(msg: String, throwable: Throwable? = null)
+}
+
+class EventDispatcher<C: EventCategory, E: Event<C>, F: EventListener<C, E>>(val category: EventCategory) {
     private val _listeners: MutableList<F> = mutableListOf()
 
     @Suppress("MemberVisibilityCanBePrivate")
@@ -46,23 +63,16 @@ class EventDispatcher<C: EventCategory, E: Event<C>, R, F: EventListener<C, E>> 
     }
 }
 
-enum class LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error;
+data class ConnectionAttemptEvent(override val category: StandardEventCategory,
+    override val server: WebSocketServer, val socket: Socket) : Event<StandardEventCategory> {
+
+    var doAccept: Boolean = true
 }
 
-interface LogDispatcher {
-    fun trace(msg: String)
-    fun trace(t: Throwable)
-    fun debug(msg: String)
-    fun debug(t: Throwable)
-    fun info(msg: String)
-    fun info(t: Throwable)
-    fun warn(msg: String)
-    fun warn(t: Throwable)
-    fun error(throwable: Throwable?)
-    fun error(msg: String, throwable: Throwable?)
-}
+data class ConnectionEvent(override val category: StandardEventCategory,
+                           override val server: WebSocketServer, val client: Client) : Event<StandardEventCategory>
+data class FrameEvent(override val category: StandardEventCategory, override val server: WebSocketServer,
+                      val client: Client, val frame: WebSocketFrame) : Event<StandardEventCategory>
+data class ConnectionCloseEvent(override val category: StandardEventCategory, override val server: WebSocketServer,
+                                val client: Client, val statusCode: Int?,
+                                val msg: String?) : Event<StandardEventCategory>

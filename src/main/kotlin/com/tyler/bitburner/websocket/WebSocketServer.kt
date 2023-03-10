@@ -61,15 +61,15 @@ enum class OpCode(private val op: Int) {
     Text(0x1),
     /** A binary frame. This contains binary data that is not guaranteed to be of any specific format */
     Binary(0x2),
-    /** Custom opcodes for application use. These are only used if the client/server knows what they mean. */
+    /** Custom content opcode for application use. These are only used if the client/server knows what they mean. */
     Custom1(0x3),
-    /** Custom opcodes for application use. These are only used if the client/server knows what they mean. */
+    /** Custom content opcode for application use. These are only used if the client/server knows what they mean. */
     Custom2(0x4),
-    /** Custom opcodes for application use. These are only used if the client/server knows what they mean. */
+    /** Custom content opcode for application use. These are only used if the client/server knows what they mean. */
     Custom3(0x5),
-    /** Custom opcodes for application use. These are only used if the client/server knows what they mean. */
+    /** Custom content opcode for application use. These are only used if the client/server knows what they mean. */
     Custom4(0x6),
-    /** Custom opcodes for application use. These are only used if the client/server knows what they mean. */
+    /** Custom content opcode for application use. These are only used if the client/server knows what they mean. */
     Custom5(0x7),
     /** Close frame. This is used by either end to close a connection cleanly. The server mostly manages these. */
     Close(0x8),
@@ -81,15 +81,15 @@ enum class OpCode(private val op: Int) {
     Ping(0x9),
     /** Pong frame. A response to a [OpCode.Ping]. */
     Pong(0xA),
-    /** Reserved for extensions. As of writing this, they are invalid. */
+    /** Reserved control opcode for extensions. As of writing this, they are invalid. */
     Reserved1(0xB),
-    /** Reserved for extensions. As of writing this, they are invalid. */
+    /** Reserved control opcode for extensions. As of writing this, they are invalid. */
     Reserved2(0xC),
-    /** Reserved for extensions. As of writing this, they are invalid. */
+    /** Reserved control opcode for extensions. As of writing this, they are invalid. */
     Reserved3(0xD),
-    /** Reserved for extensions. As of writing this, they are invalid. */
+    /** Reserved control opcode for extensions. As of writing this, they are invalid. */
     Reserved4(0xE),
-    /** Reserved for extensions. As of writing this, they are invalid. */
+    /** Reserved control opcode for extensions. As of writing this, they are invalid. */
     Reserved5(0xF);
 
     companion object {
@@ -125,10 +125,26 @@ enum class OpCode(private val op: Int) {
 
     /**
      * Returns true if the frame is a control frame. That is, a frame used to control aspects of the protocol rather
-     * than send user data.
+     * than exclusively to send user data.
      */
     fun isControlFrame() = when(this) {
-        Continuation, Close, Ping, Pong -> true
+        Continuation, Close, Ping, Pong, Custom1, Custom2, Custom3, Custom4, Custom5 -> true
+        else -> false
+    }
+
+    /**
+     * Returns whether this opcode is a custom content opcode, corresponding to [OpCode.Custom1]..[OpCode.Custom5].
+     */
+    fun isCustomContentOp() = when (this) {
+        Custom1, Custom2, Custom3, Custom4, Custom5 -> true
+        else -> false
+    }
+
+    /**
+     * Returns whether this opcode is a reserved control opcode, corresponding to [OpCode.Reserved1]..[OpCode.Reserved5].
+     */
+    fun isReservedOp() = when (this) {
+        Reserved1, Reserved2, Reserved3, Reserved4, Reserved5 -> true
         else -> false
     }
 
@@ -158,8 +174,8 @@ enum class OpCode(private val op: Int) {
  * @param disableAutoPing whether pings are automatically sent on an interval
  */
 class Client(val socket: Socket,
-             internal var inputStream: BufferedInputStream,
-             internal var outputStream: OutputStream,
+             internal val inputStream: BufferedInputStream,
+             internal val outputStream: OutputStream,
              internal val server: WebSocketServer,
              val disableAutoPing: Boolean = false,
             ) : Disposable
@@ -194,11 +210,13 @@ class Client(val socket: Socket,
     private var heartbeatTimer: Timer? = null
     init {
         if (!disableAutoPing) {
-            timer(period=PERIOD_MS, initialDelay=2000) {
-                if (socket.isClosed || !socket.isConnected) {
-                    server.logDispatcher?.warn("Underlying WebSocket socket closed from under us")
+            timer(period=PERIOD_MS, initialDelay=5000) {
+                if (socket.isClosed) {
+                    server.logDispatcher?.info("Underlying WebSocket socket closed from under us")
                     server.clientDisconnected(this@Client, CloseStatusCode.AbnormalClosure)
                     socket.close()
+                    this.cancel()
+                    heartbeatTimer = null
                 } else if(handshakeComplete) {
                     lastPing = System.nanoTime()
                     ping()
@@ -210,11 +228,26 @@ class Client(val socket: Socket,
                         server.logDispatcher?.warn("Pong timeout - the client is not responding.")
                         server.clientDisconnected(this@Client)
                         this@Client.close(CloseStatusCode.ProtocolError, message="Connection Timeout")
+                        this.cancel()
+                        heartbeatTimer = null
                     }
                 }
             }
         }
     }
+
+    /**
+     * Return true if the WebSocket upgrade has completed successfully. Before this, the [Client] should be considered
+     * to be in HTTP mode, and writing to it will be blocked.
+     */
+    val upgradeCompleted: Boolean
+        get() = handshakeComplete
+
+    /**
+     * Return a string giving the address and port of this client.
+     */
+    val addressStr =
+        "${socket.inetAddress}:${socket.port}"
 
     /**
      * This will hard close the client socket, not doing any closing negotiation. This means it is near instant.
@@ -241,27 +274,50 @@ class Client(val socket: Socket,
      * formatted, but setting headers such as reserve flags is not recommended unless you really know what you are doing.
      *
      * When in doubt, create a header with only the fields you need and use the default values for the rest.
+     *
+     * @throws WebSocketException write was called on a client that has not completed upgrade handshake. Check
+     * [Client.upgradeCompleted] before writing if you are unsure.
      */
     fun write(data: ByteArray, header: WebSocketHeader) {
+        if (!upgradeCompleted) {
+            server.logDispatcher?.warn(
+            "Tried to send WebSocket data over a connection that has yet to successfully " +
+                    "complete the upgrade handshake. The write will be ignored.")
+            return
+        }
         server.logDispatcher?.debug("Sending frame ${header}.")
         val headerData = header.encode()
         val frameData = headerData + data
         header.length = data.size.toLong()
         outputStream.write(frameData)
+
+        val frame = WebSocketFrame(header, data)
+        server.frameSent(FrameEvent(StandardEventCategory.FrameSent, server, this, frame))
     }
 
     /**
      * Send a ping
      */
-    fun ping() {
+    fun ping(msg: ByteArray? = null) {
         server.logDispatcher?.info("Ping sent")
-        write(ByteArray(0), WebSocketHeader(0, opcode=OpCode.Ping))
+        val data = msg ?: ByteArray(0)
+        write(data, WebSocketHeader(data.size.toLong(), opcode=OpCode.Ping))
+    }
+
+    /**
+     * Send a pong.
+     *
+     * This does not necessarily have to be in response to a ping. It can be a unidirectional heartbeat. The client
+     * is not expected to respond, however.
+     */
+    fun pong(msg: ByteArray? = null) {
+        server.logDispatcher?.info("Pong sent")
+        val data = msg ?: ByteArray(0)
+        write(data, WebSocketHeader(data.size.toLong(), opcode=OpCode.Pong))
     }
 
     /**
      * Notify a client that a pong is received.
-     *
-     * This ex
      */
     fun pongReceived(frame: WebSocketFrame) {
         if (frame.header.opCode == OpCode.Pong) {
@@ -296,6 +352,7 @@ class Client(val socket: Socket,
 
 
             write(buf.toByteArray(), WebSocketHeader(OpCode.Ping))
+            server.logDispatcher?.info("Close frame sent to \"$addressStr\"")
             withContext(Dispatchers.IO) {
                 client.outputStream.close()
             }
@@ -321,9 +378,12 @@ class Client(val socket: Socket,
                 inputStream.close()
             }
 
-            server.logDispatcher?.info("Clean connection negotiation completed for ${socket.inetAddress}:${socket.port}. " +
+            server.logDispatcher?.info("Clean connection negotiation completed for \"$addressStr\"" +
                     "Final status: $status." + (exitMsg ?: "")
             )
+            server.connectionClosedGracefully(ConnectionCloseEvent(StandardEventCategory.ConnectionClosedGracefully,
+                server, this@Client, status, exitMsg))
+
 
             withContext(Dispatchers.IO) {
                 socket.close()
@@ -376,9 +436,6 @@ data class WebSocketHeader(var length: Long, private val opcode: Int, var final:
         }
     }
 
-    fun hasExtendedLen() = length > 125
-    fun hasLongExtendedLen() = length > 65535
-
     companion object {
         /**
          * Decode a header from a stream
@@ -418,6 +475,50 @@ data class WebSocketHeader(var length: Long, private val opcode: Int, var final:
      */
     val opCode: OpCode
         get() = OpCode.fromValue(opcode)
+
+    /**
+     * Return whether this is a control frame.
+     *
+     * @see [OpCode.isControlFrame]
+     */
+    fun isControlFrame(): Boolean = opCode.isControlFrame()
+
+    /**
+     * Return whether this is a custom content opcode frame.
+     *
+     * @see [OpCode.isCustomContentOp]
+     */
+    fun isCustomOpFrame(): Boolean = opCode.isCustomContentOp()
+
+    /**
+     * Return whether this is a reserved control frame.
+     *
+     * @see [OpCode.isReservedOp]
+     */
+    fun isReservedOpFrame(): Boolean = opCode.isReservedOp()
+
+    /**
+     * The frame header uses an extended length. This means the length is > 125, and it increases the length of the
+     * header data by either 2 or 8 bytes.
+     */
+    fun hasExtendedLen() = length > 125
+
+    /**
+     * The frame header is extended and uses a [Long] extended length. in this case the header contains 8 bytes holding
+     * the length. This is the case if the length field is longer than what fits in a 16-bit unsigned integer (65,535).
+     *
+     * Due to the experimental nature of [ULong], this library opts to use [Long] to store the value and thus
+     * technically does not support valid values where the 64-th bit is significant, however if such a frame is
+     * received you have bigger problems with the fact you just got over 9 exabytes over the wire.
+     *
+     * This library artificially limits frames to 2 GiB in length. This is because of the problematic nature of the JVM
+     * using [Int] as the index type for most collections, and thus makes storing such a frame nicely difficult for
+     * the purpose of supporting a rare event.
+     *
+     * If you are receiving legitimate data over 2 GiB, you will need to handle [OpCode.Continuation] frames yourself.
+     * This isn't currently implemented, but is planned
+     */
+    fun hasLongExtendedLen() = length > 65535
 
     /**
      * Size of the encoded header in bytes. This can range from 2 to 14
@@ -481,11 +582,11 @@ data class WebSocketHeader(var length: Long, private val opcode: Int, var final:
             if (resv1) "resv1=true" else "",
             if (resv2) "resv2=true" else "",
             if (resv3) "resv3=true" else ""
-        ).joinToString(", ").let {
-            if (it.isNotEmpty()) {
+        ).joinToString(",").let {
+            if (it.isNotEmpty() && !it.endsWith(",,")) {
                 ", $it"
             } else {
-                it
+                it.trimEnd(',')
             }
         }.let {
             return "WebSocketHeader:$length [op=${opCode}] (fin=$final, masked=$masked$it)"
@@ -518,7 +619,7 @@ data class WebSocketHeader(var length: Long, private val opcode: Int, var final:
  * Represents a full WebSocket frame. This consists of a header and an optional payload.
  *
  * Because of how the [WebSocketServer] works, continuation frames are automatically appended and thus aren't exposed
- * to the user.
+ * to the user in normal usage.
  */
 class WebSocketFrame(val header: WebSocketHeader, internal val data: ByteArray) {
     /**
@@ -527,7 +628,7 @@ class WebSocketFrame(val header: WebSocketHeader, internal val data: ByteArray) 
      *
      * @return the utf-8 [String] if by spec the body must be utf-8, or null if decoding as utf-8 fails for frames
      * with optional bodies. It will also return null automatically
-     * for opcodes that cannot correctly be interpreted as utf-8: [OpCode.Binary].
+     * for opcodes that should not be interpreted as utf-8: [OpCode.Binary].
      * If it is an [OpCode.Close], messages are interpreted slightly differently but this is handled transparently.
      * [OpCode.Text] will always return a valid string, with replacement characters for invalid characters.
      * There shouldn't be invalid characters for a properly behaving client.
@@ -555,6 +656,36 @@ class WebSocketFrame(val header: WebSocketHeader, internal val data: ByteArray) 
      */
     val bytes: ByteArray
         get() = data
+
+    /**
+     * Return the content length of the frame. This is equivalent to [WebSocketHeader.length].
+     */
+    val length: Long =
+        header.length
+
+    /**
+     * Return the [OpCode] for the frame. This is equivalent to [WebSocketHeader.opCode]
+     */
+    val opCode: OpCode =
+        header.opCode
+
+    /**
+     * Get the optional status code of an [OpCode.Close] frame.
+     *
+     * For all other frames, this will return null.
+     */
+    val closeStatusCode: Int? =
+        if (header.opCode == OpCode.Close) {
+            if (header.length >= 2) {
+                ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
+                    .asShortBuffer()[0].toInt()
+            } else {
+                null
+            }
+        } else {
+            null
+        }
+
 }
 
 /**
@@ -578,13 +709,12 @@ internal class NonOwningInputStreamReader(stream: InputStream, charset: Charset 
  * extended in the future to multiple simultaneous clients if that becomes useful.
  *
  * @param logDispatcher an optional instance of a LogDispatcher that sends internal log messages to the application
- * logDispatcher?.
+ * logger. WebSocketServer tries to keep dependencies lean and non-opinionated.
  */
-// @Suppress("PrivatePropertyName", "PropertyName")
 class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
     companion object {
         /**
-         *
+         * Apply WebSocket masking to the content of a message,
          */
         fun applyMasking(data: ByteArray, mask: ByteArray) {
             for (i in data.indices) {
@@ -607,6 +737,7 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
     internal var listenJob: Job? = null
 
     private var _eventChannel = Channel<String>(CHANNEL_BACKLOG)
+    private var _frameInProgress: WebSocketFrame? = null
 
     internal val client
         get() = _client
@@ -652,7 +783,8 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
             try {
                 // Just in case any jobs are stragglers, we get rid of them now.
                 scope?.cancel("Server shutdown")
-            } catch(_: Throwable) {
+            } catch(t: Throwable) {
+                logDispatcher?.error("Exception encountered when stopping server", t)
             }
         }
 
@@ -663,6 +795,75 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
     // Public general api }}}
 
     // {{{ Public events api
+
+    /**
+     * Invoked when a client has made a connection but before registering them with the server.
+     *
+     * A client can be rejected by setting [ConnectionAttemptEvent.doAccept] to false in a handler.
+     */
+    val connectionAttempted = EventDispatcher<StandardEventCategory, ConnectionAttemptEvent,
+            EventListener<StandardEventCategory, ConnectionAttemptEvent>>(StandardEventCategory.ConnectionAttempt)
+
+    /**
+     * Invoked when a connection is made, a [Client] is created, and it is registered with the server, but before
+     * the WebSocket handshake is complete. This is still operating as an HTTP stream until the handshake completes.
+     */
+    val connectionAccepted = EventDispatcher<StandardEventCategory, ConnectionEvent,
+            EventListener<StandardEventCategory, ConnectionEvent>>(StandardEventCategory.ConnectionAccepted)
+
+    /**
+     * Invoked when a connection successfully completes the WebSocket handshake protocol and the [Client] is ready
+     * to send and receive WebSocket frames.
+     */
+    val webSocketNegotiated = EventDispatcher<StandardEventCategory, ConnectionEvent,
+            EventListener<StandardEventCategory, ConnectionEvent>>(StandardEventCategory.WebsocketNegotiated)
+
+    /**
+     * Invoked when a connection starts the closing process, when [Client.forceClose] is used or when
+     * the client either sends a [OpCode.Close] frame or closes the socket.
+     *
+     * The [ConnectionCloseEvent.statusCode] and [ConnectionCloseEvent.msg] fields of the event are the status
+     * and optional messages provided by the [WebSocketServer].
+     */
+    val connectionClosing = EventDispatcher<StandardEventCategory, ConnectionCloseEvent,
+            EventListener<StandardEventCategory, ConnectionCloseEvent>>(StandardEventCategory.ConnectionClosing)
+
+    /**
+     * Invoked when the client close process is completed gracefully. It is not forbidden for a connection to be
+     * closed ungracefully, so this event will not be generated for all cases where a connection is closed.
+     * Use [connectionClosing] in that case.
+     *
+     * The [ConnectionCloseEvent.statusCode] and [ConnectionCloseEvent.msg] fields of the event are the status
+     * and optional messages provided by the _client_ after the closing handshake completes.
+     */
+    val connectionClosedGracefully = EventDispatcher<StandardEventCategory, ConnectionCloseEvent,
+            EventListener<StandardEventCategory, ConnectionCloseEvent>>(StandardEventCategory.ConnectionClosing)
+
+    /**
+     * Invoked when a [OpCode.Text] or [OpCode.Binary] frame is received, or a custom opcode frame.
+     *
+     * These are frames to transmit user defined data only, in contrast to control frames which are
+     * used for controlling the WebSocket protocol.
+     * A [OpCode.Continuation] frame is also a content frame, but it is not exposed by [WebSocketServer] and is
+     * folded internally into a single, whole frame.
+     */
+    val contentFrameReceived = EventDispatcher<StandardEventCategory, FrameEvent,
+            EventListener<StandardEventCategory, FrameEvent>>(StandardEventCategory.ContentFrameReceived)
+
+    /**
+     * Invoked when a control frame is received.
+     *
+     * Control frames are frames for controlling the WebSocketServer.
+     * They include [OpCode.Close], [OpCode.Ping], [OpCode.Pong] and the reserved opcodes.
+     * A user of WebSocketServer does not need to explicitly interact with these frames normally,
+     * but they may if they desire.
+     */
+    val controlFrameReceived = EventDispatcher<StandardEventCategory, FrameEvent,
+            EventListener<StandardEventCategory, FrameEvent>>(StandardEventCategory.ControlFrameReceived)
+
+    val frameSent = EventDispatcher<StandardEventCategory, FrameEvent,
+            EventListener<StandardEventCategory, FrameEvent>>(StandardEventCategory.ControlFrameReceived)
+
     // Public events api }}}
 
     // {{{ Internal events api
@@ -670,6 +871,8 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
     internal fun closeClientConnection(client: Client,
                               statusCode: CloseStatusCode = CloseStatusCode.Normal,
                               msg: String? = null): Job? {
+        connectionClosing(
+            ConnectionCloseEvent(StandardEventCategory.ConnectionClosing, this, client, statusCode.value, msg))
         val job: Job? = client.close(statusCode, msg)
         if (client == this._client) {
             this._client = null
@@ -682,14 +885,17 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
     }
 
     internal fun clientHandshakeSuccess(client: Client) {
-
+        webSocketNegotiated(ConnectionEvent(StandardEventCategory.WebsocketNegotiated, this, client))
     }
 
     internal fun clientDisconnected(client: Client,
-                                    statusCode: CloseStatusCode = CloseStatusCode.Normal) {
+                                    statusCode: CloseStatusCode = CloseStatusCode.Normal,
+                                    msg: String? = null) {
         if (client == this._client) {
             this._client = null
         }
+        connectionClosing(ConnectionCloseEvent(StandardEventCategory.ConnectionClosing, this, client,
+            statusCode.value, msg))
     }
 
     // Internal events api }}}
@@ -704,6 +910,16 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
                 val clientSocket = withContext(Dispatchers.IO) {
                     listenSocket.accept()
                 }
+                val event = ConnectionAttemptEvent(StandardEventCategory.ConnectionAttempt, this, clientSocket)
+                logDispatcher
+                    ?.info("Incoming client connection from ${clientSocket.inetAddress}:${clientSocket.port}")
+                if (!event.doAccept) {
+                    withContext(Dispatchers.IO) {
+                        clientSocket.close()
+                        logDispatcher?.info("Incoming connection rejected")
+                    }
+                    break
+                }
                 if (clientSocket != null) {
                     val inputStream = withContext(Dispatchers.IO) {
                         BufferedInputStream(clientSocket.getInputStream())
@@ -711,21 +927,18 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
                     val outputStream = withContext(Dispatchers.IO) {
                         clientSocket.getOutputStream()
                     }
-                    logDispatcher?.info("Incoming client connection")
-
 
                     val client = Client(clientSocket, inputStream, outputStream, this)
                     clientConnected(client)
 
                     withContext(Dispatchers.IO) {
                         doHandshake(client)
-                    }.let {
-                        if (this._client != null) {
-                            this._client!!.runnerJob =
-                                coroutineScope?.launch {
-                                    clientWorker(client)
-                                }
-                        }
+                    }
+                    if (this._client != null) {
+                        this._client!!.runnerJob =
+                            coroutineScope?.launch {
+                                clientWorker(client)
+                            }
                     }
                 }
                 yield()
@@ -735,15 +948,12 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
 
     private suspend fun clientWorker(client: Client) {
         var frameId = 0
-
-        // We use this for slowing checking down when we aren't currently getting many frames
-        var lastContentFrameId = 0
         while (!client.socket.isClosed && this._client != null) {
             val frame = withContext(Dispatchers.IO) {
                 parseFrame(client)
             }
-            logDispatcher?.debug(frame.header.toString())
-            logDispatcher?.debug("\tData: ${String(frame.data, Charset.forName("utf-8"))}")
+            logDispatcher?.info(frame.header.toString())
+            logDispatcher?.info("\tData: ${String(frame.data, Charset.forName("utf-8"))}")
 
             when (frame.header.opCode) {
                 OpCode.Continuation -> {
@@ -751,33 +961,29 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
                             "This is a client or server bug!")
                     logDispatcher?.error(ex)
                 }
-                OpCode.Text -> {
-                    logDispatcher?.info("Text Frame")
-                }
-                OpCode.Binary -> {
-                    logDispatcher?.info("Data Frame")
-                }
-                OpCode.Custom1, OpCode.Custom2, OpCode.Custom3, OpCode.Custom4, OpCode.Custom5 -> {
-                    logDispatcher?.info("Custom frame")
+                OpCode.Binary, OpCode.Text, OpCode.Custom1, OpCode.Custom2, OpCode.Custom3,
+                    OpCode.Custom4, OpCode.Custom5 -> {
+                        contentFrameReceived(FrameEvent(StandardEventCategory.ContentFrameReceived,
+                            this, client, frame))
                 }
                 OpCode.Close -> {
                     logDispatcher?.warn("Client requested WebSocket closure")
-                    if (frame.data.size >= 2) {
-                        val statusCode: Short = ByteBuffer.wrap(frame.data).order(ByteOrder.BIG_ENDIAN)
-                            .asShortBuffer()[0]
-                    }
+                    connectionClosing(ConnectionCloseEvent(StandardEventCategory.ConnectionClosing, this, client,
+                        frame.closeStatusCode, frame.textContent))
                 }
                 OpCode.Ping -> {
                     logDispatcher?.info("Ping received")
-                    client.ping()
+                    client.pong(frame.bytes)
                 }
                 OpCode.Pong -> {
                     logDispatcher?.info("Pong received")
+                    controlFrameReceived(FrameEvent(StandardEventCategory.ControlFrameReceived, this,
+                            client, frame))
                     client.pongReceived(frame)
                 }
                 else -> {
-                    val error =  WebSocketException("Found a reserved opcode outside the valid range.")
-                    logDispatcher?.error(error)
+                    val error =  WebSocketException("Found a reserved control opcode outside the valid range.")
+                    logDispatcher?.warn(error)
                     throw error
                 }
             }
@@ -859,7 +1065,6 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
                 this._client = null
             }
         }
-        headers.clear()
     }
 
     private suspend fun sendHandshakeResponse(client: Client, headers: Map<String, MutableList<String>>) {
@@ -891,13 +1096,10 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
         logDispatcher?.info("Protocol upgrade response:\n$responseStr")
         withContext(Dispatchers.IO) {
             client.outputStream.write(responseStr.encodeToByteArray())
-            client.outputStream.flush()
         }
-
-        val clientAddr = client.socket.inetAddress.toString()
-        val port = client.socket.localPort
-
+        // client.outputStream.flush()
         client.handshakeComplete = true
+        webSocketNegotiated(ConnectionEvent(StandardEventCategory.WebsocketNegotiated, this, client))
     }
 
     /** Like receiveBytes at the package level, but uses the client. */

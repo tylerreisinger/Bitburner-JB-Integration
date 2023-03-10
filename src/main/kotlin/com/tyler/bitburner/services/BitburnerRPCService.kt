@@ -5,9 +5,7 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.project.Project
-import com.tyler.bitburner.websocket.LogDispatcher
-import com.tyler.bitburner.websocket.LogLevel
-import com.tyler.bitburner.websocket.WebSocketServer
+import com.tyler.bitburner.websocket.*
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 
@@ -43,6 +41,7 @@ class BitburnerRPCService(proj: Project) : Disposable {
     fun start(port: Int) {
         _server = WebSocketServer(IntelliJLogDispatcher())
         _server?.start(port)
+        registerEventListeners()
     }
 
     /**
@@ -76,6 +75,70 @@ class BitburnerRPCService(proj: Project) : Disposable {
         logger.info(
             "${WebSocketServer::class.simpleName}.dispose took ${System.currentTimeMillis() - startTime} ms")
     }
+
+    private fun contentFrameReceived(event: FrameEvent) {
+        var logStr = "Received content frame: ${event.frame.header}"
+        if (event.frame.length > 0) {
+            val body = event.frame.textContent
+            if (body != null) {
+                logStr += "\n\t$body"
+            }
+        }
+        logger.info(logStr)
+    }
+
+    private fun controlFrameReceived(event: FrameEvent) {
+        var logStr = "Received control frame: ${event.frame.header}"
+        if (event.frame.length > 0) {
+            val body = event.frame.textContent
+            if (body != null) {
+                if (event.frame.header.opCode == OpCode.Close) {
+                    logStr += "\n\tExit code: ${event.frame.closeStatusCode}. '$body'"
+                }
+            }
+        }
+        logger.info(logStr)
+    }
+
+    private fun webSocketNegotiated(event: ConnectionEvent) {
+        val name = "${event.client.socket.inetAddress}:${event.client.socket.port}"
+        logger.info("Client '$name' successfully upgraded to a WebSocket connection")
+    }
+
+    private fun connectionClosing(event: ConnectionCloseEvent) {
+        var logStr = "'${event.client.addressStr}' is closed or closing."
+        if (event.statusCode != null) {
+            logStr += " Code ${event.statusCode}"
+        }
+        if (event.msg != null) {
+            logStr += "\n\"${event.msg}\""
+        }
+        logger.info(logStr)
+    }
+
+    private fun connectionClosedGracefully(event: ConnectionCloseEvent) {
+        var logStr = "'${event.client.addressStr}' closed gracefully"
+        if (event.statusCode != null) {
+            logStr += " Code ${event.statusCode}"
+        }
+        if (event.msg != null) {
+            logStr += "\n\"${event.msg}\""
+        }
+        logger.info(logStr)
+    }
+
+    private fun frameSent(event: FrameEvent) {
+        logger.info("Frame sent: ${event.frame.header}")
+    }
+
+    private fun registerEventListeners() {
+        server?.contentFrameReceived?.register(this::contentFrameReceived)
+        server?.controlFrameReceived?.register(this::controlFrameReceived)
+        server?.webSocketNegotiated?.register(this::webSocketNegotiated)
+        server?.connectionClosing?.register(this::connectionClosing)
+        server?.connectionClosedGracefully?.register(this::connectionClosedGracefully)
+        server?.frameSent?.register(this::frameSent)
+    }
 }
 
 class IntelliJLogDispatcher : LogDispatcher {
@@ -106,6 +169,7 @@ class IntelliJLogDispatcher : LogDispatcher {
     override fun warn(t: Throwable) {
         logger.warn(t)
     }
+
     override fun error(throwable: Throwable?) {
         logger.error(throwable)
     }
