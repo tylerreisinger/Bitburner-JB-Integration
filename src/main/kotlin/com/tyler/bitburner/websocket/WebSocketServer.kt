@@ -5,7 +5,6 @@ package com.tyler.bitburner.websocket
 import com.intellij.openapi.Disposable
 import com.intellij.util.io.toByteArray
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
 import java.io.*
 import java.net.ServerSocket
 import java.net.Socket
@@ -193,13 +192,13 @@ class Client(val socket: Socket,
          * what any reasonable network and processing latency might cause, but below what a stalled connection for
          * any reason can be assumed to wait. This value is pretty active, but in cases of needing to release a stalled
          * connection before we can accept another, should be reasonable. The amount of wire data should be
-         * 2 bytes divided by this per millisecond on average.
+         * 4 bytes divided by this per millisecond on average.
          *
          * Consider 2 * [PERIOD_MS] the length of time you are willing to tolerate between the last
          * receipt, and when the connection should be terminated. This value is mutable in the companion object,
          * meaning you can, in the module used, set it to something else which will be used for all clients.
          */
-        var PERIOD_MS: Long = 30000
+        var PERIOD_MS: Long = 60_000
     }
 
     internal var handshakeComplete = false
@@ -211,12 +210,13 @@ class Client(val socket: Socket,
     init {
         if (!disableAutoPing) {
             timer(period=PERIOD_MS, initialDelay=5000) {
-                if (socket.isClosed) {
-                    server.logDispatcher?.info("Underlying WebSocket socket closed from under us")
+                if (socket.isClosed || !socket.isConnected || socket.isOutputShutdown) {
+                    server.logDispatcher?.info("HeartbeatTimer: Underlying WebSocket socket closed from under us." +
+                            " Stopping")
                     server.clientDisconnected(this@Client, CloseStatusCode.AbnormalClosure)
                     socket.close()
-                    this.cancel()
                     heartbeatTimer = null
+                    this.cancel()
                 } else if(handshakeComplete) {
                     lastPing = System.nanoTime()
                     ping()
@@ -228,8 +228,8 @@ class Client(val socket: Socket,
                         server.logDispatcher?.warn("Pong timeout - the client is not responding.")
                         server.clientDisconnected(this@Client)
                         this@Client.close(CloseStatusCode.ProtocolError, message="Connection Timeout")
-                        this.cancel()
                         heartbeatTimer = null
+                        this.cancel()
                     }
                 }
             }
@@ -247,7 +247,7 @@ class Client(val socket: Socket,
      * Return a string giving the address and port of this client.
      */
     val addressStr =
-        "${socket.inetAddress}:${socket.port}"
+        "${socket.inetAddress}:${socket.localPort}"
 
     /**
      * This will hard close the client socket, not doing any closing negotiation. This means it is near instant.
@@ -285,7 +285,6 @@ class Client(val socket: Socket,
                     "complete the upgrade handshake. The write will be ignored.")
             return
         }
-        server.logDispatcher?.debug("Sending frame ${header}.")
         val headerData = header.encode()
         val frameData = headerData + data
         header.length = data.size.toLong()
@@ -299,7 +298,7 @@ class Client(val socket: Socket,
      * Send a ping
      */
     fun ping(msg: ByteArray? = null) {
-        server.logDispatcher?.info("Ping sent")
+        server.logDispatcher?.debug("Ping sent")
         val data = msg ?: ByteArray(0)
         write(data, WebSocketHeader(data.size.toLong(), opcode=OpCode.Ping))
     }
@@ -311,7 +310,7 @@ class Client(val socket: Socket,
      * is not expected to respond, however.
      */
     fun pong(msg: ByteArray? = null) {
-        server.logDispatcher?.info("Pong sent")
+        server.logDispatcher?.debug("Pong sent")
         val data = msg ?: ByteArray(0)
         write(data, WebSocketHeader(data.size.toLong(), opcode=OpCode.Pong))
     }
@@ -336,57 +335,65 @@ class Client(val socket: Socket,
      * @return a job that completes when the closing process is completed
      */
     fun close(statusCode: CloseStatusCode, message: String? = null): Job? {
+        val clientObj = this
         server.clientDisconnected(this, statusCode)
         heartbeatTimer?.cancel()
         // Kill the original worker job, we will create a special closing worker to handle closing protocol.
         runnerJob?.cancel()
 
-        // After this, the client is completely de-associated with the WebSocketServer instance
+
         return server.coroutineScope?.launch {
-            val client = this@Client
-            val len = (2 + (message?.length ?: 0)).toLong()
-            val outData = ByteArray(len.toInt())
-            val buf = ByteBuffer.wrap(outData)
-                .putShort(statusCode.value.toShort())
-                .put(message?.encodeToByteArray() ?: byteArrayOf())
+            try {
+                val len = (2 + (message?.length ?: 0)).toLong()
+                val outData = ByteArray(len.toInt())
+                val buf = ByteBuffer.wrap(outData)
+                    .putShort(statusCode.value.toShort())
+                    .put(message?.encodeToByteArray() ?: byteArrayOf())
 
-
-            write(buf.toByteArray(), WebSocketHeader(OpCode.Ping))
-            server.logDispatcher?.info("Close frame sent to \"$addressStr\"")
-            withContext(Dispatchers.IO) {
-                client.outputStream.close()
-            }
-            val header = withContext(Dispatchers.IO) {
-                WebSocketHeader.decode(inputStream)
-            }
-            val status: Int? =
-                if (header.length >= 2) {
-                    ByteBuffer.wrap(receiveBytes(inputStream, header.length.toInt()))
-                        .asShortBuffer()[0].toUShort().toInt()
-                } else {
-                    null
+                write(outData, WebSocketHeader(outData.size.toLong(), OpCode.Ping))
+                server.logDispatcher?.info("Close frame sent to \"$addressStr\"")
+                withContext(Dispatchers.IO) {
+                    clientObj.outputStream.close()
                 }
 
-            val exitMsg: String? =
-                if (header.length > 2) {
-                    receiveBytes(inputStream, (header.length - 2).toInt()).decodeToString()
-                } else {
-                    null
+                var header: WebSocketHeader? = null
+                var status: Int? = null
+                var exitMsg: String? = null
+                try {
+                    header = withContext(Dispatchers.IO) {
+                        WebSocketHeader.decode(inputStream)
+                    }
+                    status =
+                        if (header.length >= 2) {
+                            ByteBuffer.wrap(receiveBytes(inputStream, header.length.toInt()))
+                                .asShortBuffer()[0].toUShort().toInt()
+                        } else {
+                            null
+                        }
+
+                    exitMsg =
+                        if (header.length > 2) {
+                            receiveBytes(inputStream, (header.length - 2).toInt()).decodeToString()
+                        } else {
+                            null
+                        }
+
+                } catch (t: Throwable) {
+                    server.logDispatcher?.info("Final close read failed. The client probably closed before " +
+                            "sending a response")
+                } finally {
+                    clientObj.inputStream.close()
+                    socket.close()
+
+                    server.logDispatcher?.info("Clean connection negotiation completed for \"$addressStr\". " +
+                            "Final status: $status. " + (exitMsg ?: "")
+                    )
+                    server.connectionClosedGracefully(ConnectionCloseEvent(StandardEventCategory.ConnectionClosedGracefully,
+                        server, this@Client, status, exitMsg))
+
                 }
-
-            withContext(Dispatchers.IO) {
-                inputStream.close()
-            }
-
-            server.logDispatcher?.info("Clean connection negotiation completed for \"$addressStr\"" +
-                    "Final status: $status." + (exitMsg ?: "")
-            )
-            server.connectionClosedGracefully(ConnectionCloseEvent(StandardEventCategory.ConnectionClosedGracefully,
-                server, this@Client, status, exitMsg))
-
-
-            withContext(Dispatchers.IO) {
-                socket.close()
+            } catch (t: Throwable) {
+                server.logDispatcher?.error(t)
             }
         }
     }
@@ -398,8 +405,12 @@ class Client(val socket: Socket,
      * The client will be closed when this returns, unlike [Client.close].
      */
     fun forceClose() {
+        heartbeatTimer?.cancel()
+        heartbeatTimer = null
+        runnerJob?.cancel()
+        runnerJob = null
         socket.close()
-        server.clientDisconnected(this, CloseStatusCode.AbnormalClosure)
+        server.clientDisconnected(this, CloseStatusCode.AbnormalClosure, "Force closed")
     }
 }
 
@@ -410,7 +421,6 @@ class WebSocketException : Exception {
     constructor() : super()
     constructor(msg: String) : super(msg)
 }
-
 
 /**
  * A header of a websocket frame.
@@ -583,13 +593,13 @@ data class WebSocketHeader(var length: Long, private val opcode: Int, var final:
             if (resv2) "resv2=true" else "",
             if (resv3) "resv3=true" else ""
         ).joinToString(",").let {
-            if (it.isNotEmpty() && !it.endsWith(",,")) {
+            if (it.trimEnd(',').isNotEmpty()) {
                 ", $it"
             } else {
                 it.trimEnd(',')
             }
         }.let {
-            return "WebSocketHeader:$length [op=${opCode}] (fin=$final, masked=$masked$it)"
+            return "WebSocketHeader(${opCode}):$length [fin=$final, masked=$masked$it]"
         }
 
     override fun equals(other: Any?): Boolean {
@@ -686,6 +696,32 @@ class WebSocketFrame(val header: WebSocketHeader, internal val data: ByteArray) 
             null
         }
 
+    /**
+     * Get a human-readable string containing the header and up to 120 chars of the body.
+     */
+    override fun toString(): String {
+        var headerStr = header.toString()
+
+        if (opCode == OpCode.Close && closeStatusCode != null) {
+            headerStr += ". Close Status: $closeStatusCode"
+        }
+        val text = textContent
+
+        val bodyStr =
+            if (text != null && text.length <= 120) {
+                if (text.isEmpty()) {
+                    ""
+                } else {
+                    "\n$text"
+                }
+            } else if (text != null) {
+                "\n${text.substring(0..120)}..."
+            } else {
+                ""
+            }
+
+        return headerStr + bodyStr
+    }
 }
 
 /**
@@ -725,10 +761,8 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
         /**
          * How many messages can be queued in the Channel at once.
          */
-        const val CHANNEL_BACKLOG: Int = 100
         private val HTTP_REQUEST_REGEX = Regex("GET (/\\w*)\\s+HTTP/[.\\d]+")
         private val HTTP_HEADER_REGEX = Regex("([-\\w]+):\\s+(.*)\\s*")
-        private val HTTP_WEBSOCKET_EXT_REGEX = Regex("Sec-Web:\\s+(.*)\\s*")
     }
 
     internal var listenSocket: ServerSocket? = null
@@ -736,7 +770,6 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
     internal var coroutineScope: CoroutineScope? = null
     internal var listenJob: Job? = null
 
-    private var _eventChannel = Channel<String>(CHANNEL_BACKLOG)
     private var _frameInProgress: WebSocketFrame? = null
 
     internal val client
@@ -772,9 +805,6 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
     fun stop(status: CloseStatusCode = CloseStatusCode.Normal, msg: String? = null): Job? {
         listenJob?.cancel()
         listenJob = null
-        _client = null
-        _eventChannel.close()
-        _eventChannel = Channel(CHANNEL_BACKLOG)
         listenSocket?.close()
         listenSocket = null
         val job = _client?.close(status, msg)
@@ -786,9 +816,8 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
             } catch(t: Throwable) {
                 logDispatcher?.error("Exception encountered when stopping server", t)
             }
+            coroutineScope = null
         }
-
-        coroutineScope = null
         return job
     }
 
@@ -861,24 +890,18 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
     val controlFrameReceived = EventDispatcher<StandardEventCategory, FrameEvent,
             EventListener<StandardEventCategory, FrameEvent>>(StandardEventCategory.ControlFrameReceived)
 
+    /**
+     * Invoked when any frame is sent by the server.
+     *
+     * This is mostly useful for introspection or debugging purposes. When the event fires, the frame is already sent
+     * and the process or frame cannot be altered.
+     */
     val frameSent = EventDispatcher<StandardEventCategory, FrameEvent,
-            EventListener<StandardEventCategory, FrameEvent>>(StandardEventCategory.ControlFrameReceived)
+            EventListener<StandardEventCategory, FrameEvent>>(StandardEventCategory.FrameSent)
 
     // Public events api }}}
 
     // {{{ Internal events api
-
-    internal fun closeClientConnection(client: Client,
-                              statusCode: CloseStatusCode = CloseStatusCode.Normal,
-                              msg: String? = null): Job? {
-        connectionClosing(
-            ConnectionCloseEvent(StandardEventCategory.ConnectionClosing, this, client, statusCode.value, msg))
-        val job: Job? = client.close(statusCode, msg)
-        if (client == this._client) {
-            this._client = null
-        }
-        return job
-    }
 
     internal fun clientConnected(client: Client) {
         this._client = client
@@ -893,9 +916,9 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
                                     msg: String? = null) {
         if (client == this._client) {
             this._client = null
+            connectionClosing(ConnectionCloseEvent(StandardEventCategory.ConnectionClosing, this, client,
+                statusCode.value, msg))
         }
-        connectionClosing(ConnectionCloseEvent(StandardEventCategory.ConnectionClosing, this, client,
-            statusCode.value, msg))
     }
 
     // Internal events api }}}
@@ -912,7 +935,8 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
                 }
                 val event = ConnectionAttemptEvent(StandardEventCategory.ConnectionAttempt, this, clientSocket)
                 logDispatcher
-                    ?.info("Incoming client connection from ${clientSocket.inetAddress}:${clientSocket.port}")
+                    ?.info("Incoming client connection from " +
+                            "\"${clientSocket.inetAddress}:${clientSocket.localPort}\"")
                 if (!event.doAccept) {
                     withContext(Dispatchers.IO) {
                         clientSocket.close()
@@ -932,7 +956,11 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
                     clientConnected(client)
 
                     withContext(Dispatchers.IO) {
-                        doHandshake(client)
+                        try {
+                            doHandshake(client)
+                        } catch (t: Throwable) {
+                            logDispatcher?.error("Error when performing handshake", t)
+                        }
                     }
                     if (this._client != null) {
                         this._client!!.runnerJob =
@@ -947,14 +975,10 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
     }
 
     private suspend fun clientWorker(client: Client) {
-        var frameId = 0
         while (!client.socket.isClosed && this._client != null) {
             val frame = withContext(Dispatchers.IO) {
                 parseFrame(client)
             }
-            logDispatcher?.info(frame.header.toString())
-            logDispatcher?.info("\tData: ${String(frame.data, Charset.forName("utf-8"))}")
-
             when (frame.header.opCode) {
                 OpCode.Continuation -> {
                     val ex = WebSocketException("Got an unexpected OpCode.Continuation frame. " +
@@ -968,15 +992,21 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
                 }
                 OpCode.Close -> {
                     logDispatcher?.warn("Client requested WebSocket closure")
-                    connectionClosing(ConnectionCloseEvent(StandardEventCategory.ConnectionClosing, this, client,
+                    val data = ByteArray(2)
+                    ByteBuffer.wrap(data).putShort(CloseStatusCode.Normal.value.toShort())
+                    client.write(data, WebSocketHeader(2, OpCode.Close))
+                    client.forceClose()
+                    connectionClosedGracefully(ConnectionCloseEvent(StandardEventCategory.ConnectionClosing, this, client,
                         frame.closeStatusCode, frame.textContent))
                 }
                 OpCode.Ping -> {
-                    logDispatcher?.info("Ping received")
+                    controlFrameReceived(FrameEvent(StandardEventCategory.ControlFrameReceived, this,
+                        client, frame))
+                    logDispatcher?.debug("Ping received")
                     client.pong(frame.bytes)
                 }
                 OpCode.Pong -> {
-                    logDispatcher?.info("Pong received")
+                    logDispatcher?.debug("Pong received")
                     controlFrameReceived(FrameEvent(StandardEventCategory.ControlFrameReceived, this,
                             client, frame))
                     client.pongReceived(frame)
@@ -1011,7 +1041,7 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
 
             if (header.length > Int.MAX_VALUE) {
                 withContext(Dispatchers.Default) {
-                    closeClientConnection(client, CloseStatusCode.FrameTooBig,
+                    client.close(CloseStatusCode.FrameTooBig,
                         "Total frame size above INT_MAX is unsupported")
                 }
             }
