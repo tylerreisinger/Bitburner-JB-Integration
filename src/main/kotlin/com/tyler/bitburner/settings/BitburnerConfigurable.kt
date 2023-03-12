@@ -1,6 +1,5 @@
 package com.tyler.bitburner.settings
 
-import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.project.Project

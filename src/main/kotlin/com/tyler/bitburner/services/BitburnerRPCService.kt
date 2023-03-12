@@ -169,7 +169,6 @@ class IntelliJLogDispatcher : LogDispatcher {
     override fun warn(t: Throwable) {
         logger.warn(t)
     }
-
     override fun error(throwable: Throwable?) {
         logger.error(throwable)
     }

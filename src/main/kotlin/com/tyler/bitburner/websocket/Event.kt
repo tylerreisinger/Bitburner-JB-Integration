@@ -5,12 +5,12 @@ import java.net.Socket
 enum class StandardEventCategory : EventCategory {
     ConnectionAttempt,
     ConnectionAccepted,
-    WebsocketNegotiated,
+    WebSocketNegotiated,
     ConnectionClosing,
     ConnectionClosedGracefully,
     ContentFrameReceived,
     ControlFrameReceived,
-    PingReceived,
+    ContinuationFrameReceived,
     FrameSent,
 }
 
@@ -23,7 +23,7 @@ interface EventCategory {
     val ordinal: Int
 }
 
-interface Event<C: EventCategory>{
+interface Event<C: EventCategory> {
     val category: C
     val server: WebSocketServer
 }
