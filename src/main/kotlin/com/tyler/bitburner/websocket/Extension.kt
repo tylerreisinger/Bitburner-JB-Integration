@@ -1,14 +1,23 @@
 package com.tyler.bitburner.websocket
 
-import java.util.*
 import java.util.zip.Deflater
 import java.util.zip.Inflater
 import kotlin.experimental.and
 
-data class ExtensionDeclaration(val name: String, val args: Map<String, String?> = mapOf()) {
-    override fun toString(): String {
-        return name + args.map { it.key + if (it.value != null) "=${it.value}" else "" }.joinToString("; ")
-    }
+
+data class ExtensionArg(val name: String, val value: String? = null) {
+    override fun toString(): String =
+        name + (if (value != null) "=$value" else "")
+}
+
+data class ExtensionProposal(val name: String, val arguments: List<ExtensionArg>) {
+    override fun toString(): String =
+        "$name; " + arguments.joinToString("; ")
+}
+
+data class ExtensionDeclaration(val name: String, val args: List<ExtensionProposal>) {
+    override fun toString(): String =
+        args.joinToString(",\n")
 }
 
 interface ProtocolExtension {
@@ -19,18 +28,28 @@ interface ProtocolExtension {
 }
 
 interface ProtocolExtensionDefinition {
+    val name: String
     fun newInstance(client: Client): ProtocolExtension
+
+    fun extensionNegotiation(extension: ExtensionDeclaration): ExtensionProposal?
 }
 
-class PerMessageDeflate(val compressCustomOps: Boolean = false): ProtocolExtension {
+open class PerMessageDeflate(val compressCustomOps: Boolean = false): ProtocolExtension {
     override val name: String
         get() = "permessage-deflate"
+
+    val definition
+        get() = PerMessageDeflateDefinition::class
 
     private val deflater = Deflater()
     private val inflater = Inflater()
 
     companion object {
-        const val DEFLATE_MIN_SIZE = 80
+        /**
+         * We won't compress on our end ever if the payload len is below this. Configurable,
+         * but compression of small text blocks is adding extra latency for little gain.
+         */
+        const val DEFLATE_MIN_SIZE = 50
     }
 
     override fun beforeFrameSend(frame: WebSocketFrame, server: WebSocketServer): WebSocketFrame {
@@ -90,12 +109,33 @@ class PerMessageDeflate(val compressCustomOps: Boolean = false): ProtocolExtensi
         }
         return frame
     }
-
 }
 
-class PerMessageDeflateDefinition(var compressCustomOps: Boolean = false):
-    ProtocolExtensionDefinition {
+@Suppress("MemberVisibilityCanBePrivate")
+open class PerMessageDeflateDefinition(val compressCustomOps: Boolean = false,
+                                       val serverNoCtxTakeover: Boolean = false): ProtocolExtensionDefinition {
+    override val name: String
+        get() = "permessage-deflate"
+
+    open val maxWindowBitsDefault: Int?
+        get() = 15
 
     override fun newInstance(client: Client): ProtocolExtension =
         PerMessageDeflate(compressCustomOps)
+
+    override fun extensionNegotiation(extension: ExtensionDeclaration): ExtensionProposal? {
+        return if (extension.args.isNotEmpty()) {
+            val proposal = extension.args[0]
+
+            proposal
+        } else {
+            // No parameters, we use our default that are allowed without client prompt
+            if (serverNoCtxTakeover) {
+                ExtensionProposal(extension.name, listOf(ExtensionArg("server_no_context_takeover")))
+            } else {
+               ExtensionProposal(extension.name,
+                    listOf(ExtensionArg("server_max_window_bits", maxWindowBitsDefault.toString())))
+            }
+        }
+    }
 }

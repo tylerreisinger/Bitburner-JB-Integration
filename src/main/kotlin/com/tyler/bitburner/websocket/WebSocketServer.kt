@@ -205,14 +205,16 @@ class Client(val socket: Socket,
     internal var lastPing: Long = System.nanoTime()
     internal var lastPong: Long = System.nanoTime()
     internal var frameInProgress: WebSocketFrame? = null
+    internal val activeProtocolExtensions: MutableList<ProtocolExtension> = mutableListOf()
 
     private var heartbeatTimer: Timer? = null
     init {
         if (!disableAutoPing) {
             timer(period=PERIOD_MS, initialDelay=5000) {
                 if (socket.isClosed || !socket.isConnected || socket.isOutputShutdown) {
-                    server.logDispatcher?.info("HeartbeatTimer: Underlying WebSocket socket closed from under us." +
-                            " Stopping")
+                    server.logDispatcher?.info(
+                        "Heartbeat Timer: Underlying WebSocket socket closed from under us." +
+                        " Stopping")
                     server.clientDisconnected(this@Client, CloseStatusCode.AbnormalClosure)
                     socket.close()
                     heartbeatTimer = null
@@ -250,6 +252,14 @@ class Client(val socket: Socket,
         "${socket.inetAddress}:${socket.localPort}"
 
     /**
+     * A list of active protocol extension object registered to this client.
+     *
+     * These may themselves offer a public API. The order is processing order in the case of multiple.
+     */
+    val protocolExtensions: List<ProtocolExtension>
+        get() = activeProtocolExtensions
+
+    /**
      * This will hard close the client socket, not doing any closing negotiation. This means it is near instant.
      *
      * Use [Client.close] instead if you can wait for the closing negotiation to complete the close "nicely". The WebSocket
@@ -258,6 +268,13 @@ class Client(val socket: Socket,
     override fun dispose() {
         forceClose()
     }
+
+    /**
+     * Returns a [ProtocolExtension] object given the name string as registered with IANA, or null if this client
+     * is not using that extension.
+     */
+    fun protocolExtension(name: String): ProtocolExtension? =
+        activeProtocolExtensions.find { it.name == name }
 
     /**
      * Write a [OpCode.Text] message to the client
@@ -600,7 +617,7 @@ data class WebSocketHeader(var length: Long, private val opcode: Int, var final:
                 it.trimEnd(',')
             }
         }.let {
-            return "WebSocketHeader(${opCode}):$length [fin=$final, masked=$masked$it]"
+            return "WebSocketHeader(${opCode}):$length {fin=$final, masked=$masked$it}"
         }
 
     override fun equals(other: Any?): Boolean {
@@ -786,8 +803,19 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
     internal var coroutineScope: CoroutineScope? = null
     internal var listenJob: Job? = null
 
+    /**
+     * Collection of known extensions. These are available for use, but are not necessarily used.
+     */
+    internal var extensionDefs: MutableMap<String, ProtocolExtensionDefinition> = mutableMapOf()
+
     val client
         get() = _client
+
+    /**
+     * Return a [Map] mapping extension name to the definition.
+     */
+    val registeredProtocolExtensions: Map<String, ProtocolExtensionDefinition>
+        get() = extensionDefs
 
     // {{{ Public general api
 
@@ -850,6 +878,16 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
             coroutineScope = null
         }
         return job
+    }
+
+    /**
+     * Register a protocol definition with the server. The extension definitions contain a unique name and handle
+     * the creation of the actual client ProtocolExtension object if the client gives a request including it.
+     *
+     * This is only for protocol extensions. If it is not registered with IANA, it is not valid to use.
+     */
+    fun addProtocolExtensionDefinition(extension: ProtocolExtensionDefinition) {
+        extensionDefs[extension.name] = extension
     }
 
     // Public general api }}}
@@ -1156,6 +1194,9 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
         if (getPath == null) {
             logDispatcher?.warn("Unsupported GET request received: $requestStr")
             clientDisconnected(client, CloseStatusCode.CantInterpret)
+            withContext(Dispatchers.IO) {
+                client.outputStream.write("HTTP/1.1 403 Forbidden".encodeToByteArray())
+            }
             client.forceClose()
             return
         }
@@ -1192,33 +1233,14 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
         }
     }
 
-    private suspend fun sendHandshakeResponse(client: Client, headers: Map<String, MutableList<String>>) {
+    private suspend fun sendHandshakeResponse(client: Client, headers: Map<String, List<String>>) {
         // The WebSocket standard itself defines this string
         val magicString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
         val responseLines = mutableListOf<String>()
 
         val secKey = headers["Sec-WebSocket-Key"]?.get(0)
-        val extensions = headers["Sec-WebSocket-Extensions"] ?: mutableListOf()
-        val extensionsFlat = extensions.flatMap { it.split(",") }
-        val extensionParamMap = mutableMapOf<String, ExtensionDeclaration>()
 
-        for (ex in extensionsFlat) {
-            val frags = ex.split(';')
-            val args = frags.map {
-                val frag = it
-                val parts = frag.split('=')
-                val name = parts[0]
-                val value: String? =
-                    if (parts.size > 1) {
-                        parts[1]
-                    } else {
-                        null
-                    }
-                name to value
-            }
-            val exDef = ExtensionDeclaration(args[0].first, mapOf(*args.subList(1, args.size).toTypedArray()))
-            extensionParamMap[exDef.name] = exDef
-        }
+        val extensionProposals = extensionNegotiation(client, headers)
 
         // The response key is required by spec to be a sha1 digest of what the client sends plus the magic string,
         // encoded in base-64.
@@ -1249,6 +1271,55 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
     /** Like receiveBytes at the package level, but uses the client. */
     private suspend fun receiveBytes(client: Client, len: Int): ByteArray {
         return receiveBytes(client.inputStream, len)
+    }
+
+    private fun extensionNegotiation(client: Client, headers: Map<String, List<String>>){
+        val extensions = headers["Sec-WebSocket-Extensions"] ?: mutableListOf()
+
+        //Group
+        val extensionsFlat = extensions.flatMap { it.split(",") }
+
+        // Tokenize and build the structure
+        val extensionMap: Map<String, ExtensionDeclaration> = extensionsFlat.map { ex ->
+            val frags = ex.split(';')
+            val exName = frags[0]
+            val args = frags.subList(1, frags.size).map {frag ->
+                val parts = frag.trim().split('=')
+                val name = parts[0]
+                val value: String? =
+                    if (parts.size > 1) {
+                        parts.subList(1, parts.size).joinToString("=")
+                    } else {
+                        null
+                    }
+                ExtensionArg(name, value)
+            }
+
+            ExtensionProposal(exName, args)
+        }.let {
+            // Construct a map of extension to proposal(s).
+            val proposalMapping: MutableMap<String, MutableList<ExtensionProposal>> = mutableMapOf()
+            for (proposal in it) {
+                if (proposal.name in proposalMapping) {
+                    proposalMapping[proposal.name]?.add(proposal)
+                } else {
+                    proposalMapping[proposal.name] = mutableListOf(proposal)
+                }
+            }
+            proposalMapping
+        }.map {
+            // Build array of declarations
+            it.key to ExtensionDeclaration(it.key, it.value)
+        }.toMap()
+
+        for (ex in registeredProtocolExtensions) {
+            if (ex.key in extensionMap) {
+                val params = ex.value.extensionNegotiation(extensionMap[ex.key]!!)
+                if (!params.isNullOrEmpty()) {
+                    logDispatcher?.info("Extension ${ex.key} is being activated for ${client.addressStr}")
+                }
+            }
+        }
     }
 
     // Private api }}}
