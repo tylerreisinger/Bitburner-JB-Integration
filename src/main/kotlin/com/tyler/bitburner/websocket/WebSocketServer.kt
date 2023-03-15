@@ -1314,8 +1314,8 @@ class WebSocketServer(var logDispatcher: LogDispatcher? = null) {
 
         for (ex in registeredProtocolExtensions) {
             if (ex.key in extensionMap) {
-                val params = ex.value.extensionNegotiation(extensionMap[ex.key]!!)
-                if (!params.isNullOrEmpty()) {
+                val proposal = ex.value.extensionNegotiation(extensionMap[ex.key]!!)
+                if (proposal != null && proposal.arguments.isNotEmpty()) {
                     logDispatcher?.info("Extension ${ex.key} is being activated for ${client.addressStr}")
                 }
             }
